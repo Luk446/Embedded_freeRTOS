@@ -8,6 +8,10 @@ Implement the same real-time application twice on the DUT:
   (B) FreeRTOS-based implementation (tick = 1 ms)
 
 Both implementations must satisfy time requirements and functional requirements.
+
+The assignment includes a set of periodic tasks and one sporadic task.
+Only periodic tasks are to be considered hard-real time.
+The sporadic task can be considered not hard-real time (i.e. eithwr soft or firm real-time).
 3. Hardware Signals
 Tester → DUT:
   • SYNC: defines global time origin T0 (rising edge)
@@ -43,19 +47,19 @@ For task X with period PX:
   IDX = k
 
 Task A
-Period: 10 ms | Deadline: 10 ms | Budget: 672,000 cycles
+Period: 10 ms | Deadline: 10 ms | Budget: 672,000 cycles 
 Compute countA = number of rising edges on IN_A during previous 10 ms.
 seed = (IDA << 16) XOR countA XOR 0xA1
 tokenA = WorkKernel(672000, seed)
 Log: A,<IDA>,<countA>, <tokenA>
 Task B
-Period: 20 ms | Deadline: 20 ms | Budget: 960,000 cycles
+Period: 20 ms | Deadline: 20 ms | Budget: 960,000 cycles (See 7.1)
 Compute countB over 20 ms window.
 seed = (IDB << 16) XOR countB XOR 0xB2
 tokenB = WorkKernel(960000, seed)
 Log: B,<IDB>,<countB>,<tokenB>
 Task AGG
-Period: 20 ms | Deadline: 20 ms | Budget: 480,000 cycles
+Period: 20 ms | Deadline: 20 ms | Budget: 480,000 cycles (See 7.1)
 If both tokenA and tokenB have been published at least once:
   agg = tokenA XOR tokenB
 Else agg = 0xDEADBEEF
@@ -63,14 +67,14 @@ seed = (IDAGG << 16) XOR agg XOR 0xD4
 tokenAGG = WorkKernel(480000, seed)
 Log: AGG<IDAAG>,<agg>,<tokenAGG>
 Task C (Mode Controlled – for FreeRTOS solution)
-Period: 50 ms | Deadline: 50 ms | Budget: 1,680,000 cycles
+Period: 50 ms | Deadline: 50 ms | Budget: 1,680,000 cycles (See 7.1)
 Always enabled for super-loop solution (Assignment 2)
 Executed only if IN_MODE == 1 for FreeRTOS solution (assignment 3)
 seed = (IDC << 16) XOR 0xC3
 tokenC = WorkKernel(1680000, seed)
 Log: C,<IDC>, <tokenC>
 Task D (Mode Controlled – for FreeRTOS solution)
-Period: 50 ms | Deadline: 50 ms | Budget: 960,000 cycles
+Period: 50 ms | Deadline: 50 ms | Budget: 960,000 cycles (See 7.1)
 Always enabled for super-loop solution (Assignment 2)
 Executed only if IN_MODE == 1 for FreeRTOS solution (assignment 3)
 seed = (IDD << 16) XOR 0xD5
@@ -80,7 +84,7 @@ Task S (Sporadic)
 Released by each rising edge of IN_S.
 Minimum inter-arrival time: 30 ms.
 Response-time requirement: ≤ 30 ms.
-Budget: 600,000 cycles total per trigger.
+Budget: 600,000 cycles total per trigger. (See 7.1)
 Let IDS be the sporadic job index (increment per trigger).
 seed = (IDS << 16) XOR 0x55
 tokenS = WorkKernel(600000, seed)
@@ -88,6 +92,40 @@ Log: S,<IDS>,<tokenS>
 7. WorkKernel
 WorkKernel(budget_cycles, seed) is provided and must not be modified.
 The tester recomputes tokens from logged seeds to verify correctness.
+7.1 Budgets for WorkKernel, based on CPU speed
+The budgets to use as first argument when calling WorkKernel must be adapted to the CPU clock of the specific ESP32 board used in the assignment, i.e. either a ESP32 Wroom 32 (nodeMCU, running at 240MHz) or a ESP32-C3 board (running at 160MHz), see following summaries.
+
+On ESP32-Wroom 32 (nodeMCU)
+Tasks	Budgets
+Task A	672,000
+Task B
+	960,000
+Task AGG
+	480,000
+Task C
+	1,680,000
+Task D
+	960,000 
+Task S
+	600,000
+
+
+On ESP32-C3 – Budgets must be reduced, i.e. divided by 1.5 (240/160) to consider the reduced clock speed when running the board at its maximum speed of 160MHz.
+
+Tasks	Budgets
+Task A	448,000
+Task B
+	640,000
+Task AGG
+	320,000
+Task C
+	1,120,000
+Task D
+	640,000
+Task S
+	400,000
+
+
 8. Super-Loop Requirements
 No FreeRTOS primitives (tasks, semaphores, queues, vTaskDelay…) allowed.
 
