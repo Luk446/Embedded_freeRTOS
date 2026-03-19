@@ -14,13 +14,40 @@ Use 0–3.3V logic levels and 50% duty cycle square waves.
 Connect SYNC and all ACK signals to the oscilloscope or logic analyzer.
 
 Verify:
-• ACK_A pulses every 10 ms from SYNC
-• ACK_B and ACK_AGG every 20 ms
-• ACK_C and ACK_D every 50 ms (only if IN_MODE=1)
-• Sporadic: time from IN_S rising edge to ACK_S falling edge ≤ 30 ms
+• ACK_A pulses once for every 10 ms cycle from SYNC
+• ACK_B and ACK_AGG pulses once every 20 ms cycle
+• ACK_C and ACK_D pulse once every 50 ms cycle (only if IN_MODE=1 for assignment 3)
+• Sporadic: time from IN_S rising edge to ACK_S falling edge ≤ 30 ms (note that this is the only not hard-real time requirements, so occasional delays are tolerated).
 
 Measure pulse width of ACK signals to confirm execution time consistency.
-3. Verifying Functional Correctness
+A template code is also provided to verify timeliness of your tasks, i.e. b31dg_assignment2_template_with_monitoring.ino 
+The example code in the template includes a monitor class and shows how it how it should be used within a cyclic executive super-loop in Arduino. If you use ESP-IDF e.g. with vscode, simply add the source of the class in two separate files, e.g.. TimingMonitor.h and TimingMonitor.c in your project). 
+Example use:
+
+static TimingMonitor g_monitor; // declare monitor as a global variable
+
+void loop() {
+  
+  ... wait for synch (e.g. with the help of an interrupt)...
+  g_monitor.sycnh(); // tell the monitor to start monitoring
+  
+  ... run your schedule ...
+
+  taskA();
+
+  ...
+
+  if (!g_monitor.allDeadlinesMet()) {
+    digitalWrite(PIN_ERR, HIGH);
+  }
+  if (g_monitor.pollReports()) {
+    while (true) {
+      asm volatile("nop"); // or exit
+    }
+  }
+}
+
+ying Functional Correctness
 Edge Counting:
 Expected edges = frequency × window duration.
 Compare expected value with UART log output.
