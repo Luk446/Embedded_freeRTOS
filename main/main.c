@@ -440,7 +440,7 @@ void app_main(void)
 {
     esp_task_wdt_deinit(); // disable task watchdog timer for testing
     monitorInit(); // initialize the monitor
-    monitorSetPeriodicReportEverySeconds(0); // disable periodic reporting 
+    monitorSetPeriodicReportEverySeconds(4); // enable periodic reporting every n seconds
     monitorSetFinalReportAfterSeconds(0); // disable final report timer
 
     gpio_init(); // initialize GPIOs and interrupts

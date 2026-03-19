@@ -1,0 +1,64 @@
+flowchart TD
+	A[app_main starts] --> B[Disable task watchdog]
+	B --> C[monitorInit and monitor report config]
+	C --> D[gpio_init: configure pins and ISRs]
+	D --> E[Wait for SYNC rising edge]
+	E --> F[Capture T0]
+	F --> G[reset_schedule_state T0]
+	G --> H[synch monitor and set schedule_started true]
+	H --> I[Enter super loop]
+
+	I --> J[Read now_us]
+
+	J --> KA{now >= next_a_us?}
+	KA -- yes --> A1[Run task A]
+	A1 --> A2[idx_a++ and next_a_us += PERIOD_A]
+	A2 --> A3[Refresh now_us]
+	A3 --> KA
+	KA -- no --> KB{now >= next_b_us?}
+
+	KB -- yes --> B1[Run task B]
+	B1 --> B2[idx_b++ and next_b_us += PERIOD_B]
+	B2 --> B3[Refresh now_us]
+	B3 --> KB
+	KB -- no --> KC{now >= next_agg_us?}
+
+	KC -- yes --> C1[Run task AGG]
+	C1 --> C2[idx_agg++ and next_agg_us += PERIOD_AGG]
+	C2 --> C3[Refresh now_us]
+	C3 --> KC
+	KC -- no --> KD{now >= next_c_us?}
+
+	KD -- yes --> D1[Run task C]
+	D1 --> D2[idx_c++ and next_c_us += PERIOD_C]
+	D2 --> D3[Refresh now_us]
+	D3 --> KD
+	KD -- no --> KE{now >= next_d_us?}
+
+	KE -- yes --> E1[Run task D]
+	E1 --> E2[idx_d++ and next_d_us += PERIOD_D]
+	E2 --> E3[Refresh now_us]
+	E3 --> KE
+	KE -- no --> L[Refresh now_us]
+
+	L --> M{pending S > 0 and\nperiodic slack > guard?}
+	M -- yes --> N{Atomically take one S release?}
+	N -- yes --> O[Run task S and idx_s++]
+	O --> I
+	N -- no --> P[monitorPollReports]
+	M -- no --> P
+
+	P --> Q{Final report printed now?}
+	Q -- yes --> R[Log final report printed]
+	Q -- no --> I
+	R --> I
+
+	%% ISR side events
+	IA[[ISR IN_A]] --> IA1[edge_count_a++]
+	IB[[ISR IN_B]] --> IB1[edge_count_b++]
+	IS[[ISR IN_S]] --> IS1{schedule_started?}
+	IS1 -- yes --> IS2[pending_s++ and notifySRelease]
+	IS1 -- no --> IS3[Ignore]
+	IY[[ISR SYNC]] --> IY1{sync_seen already?}
+	IY1 -- no --> IY2[Latch sync time and set sync_seen]
+	IY1 -- yes --> IY3[Ignore]
