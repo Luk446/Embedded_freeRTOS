@@ -15,6 +15,8 @@ Implementing a FreeRTOS super-loop scheduler on an ESP-32 using GPIO intterrupts
 
 ## GPIO 
 
+Inputs and outputs - including monitoring and expected behaviour 
+
 | Function | Pin Name | GPIO | Type | Connected To | Purpose |
 | --- | --- | --- | --- | --- | --- |
 | SYNC | PIN_SYNC | 13 | Input | Output 1 (Pulse) | Global time reference T0 (rising edge). |
