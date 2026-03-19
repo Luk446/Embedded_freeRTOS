@@ -23,7 +23,7 @@ Inputs and outputs - including monitoring and expected behaviour
 | Input A | PIN_IN_A | 14 | Input | Output 2 (Square Wave) | Rising edges for Task A computations. |
 | Input B | PIN_IN_B | 25 | Input | Output 3 (Square Wave) | Rising edges for Task B computations. |
 | Sporadic Trigger | PIN_IN_S | 26 | Input | Output 4 (Pulse) | Triggers sporadic Task S. |
-| Mode Control | PIN_IN_MODE | 27 | Input | Output 5 (Steady HIGH/LOW) | Enables/disables tasks C and D (for FreeRTOS, not super-loop). |
+| Mode Control | PIN_IN_MODE | 27 | Input | Output 5 (Steady HIGH/LOW) | Reserved mode input; configured with pulldown, not used by current super-loop scheduling logic. |
 | ACK Task A | ACK_A | 16 | Output | Probe 1 | Goes HIGH during Task A execution. |
 | ACK Task B | ACK_B | 17 | Output | Probe 2 | Goes HIGH during Task B execution. |
 | ACK Task AGG | ACK_AGG | 18 | Output | Probe 3 | Goes HIGH during Task AGG execution. |
