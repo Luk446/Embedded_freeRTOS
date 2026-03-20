@@ -9,6 +9,16 @@ Implementing a FreeRTOS super-loop scheduler on an ESP-32 using GPIO intterrupts
 4. Toggle ACK GPIOs and call monitor hooks around each task for timing/reporting
 5. Exectute workload via WorkKernel with per-task cycle budgets.
 
+## Results
+
+### Initial results
+
+Scheduler was only best effort, notes in [notes](docs/notes.md)
+
+### Final testing
+
+Scheduler properly implemented with 0 misses consistently in the monitor
+
 ### Procedural floW
 
 ![flowchart](docs/mermaid-diagram-2026-03-19-123326.png)

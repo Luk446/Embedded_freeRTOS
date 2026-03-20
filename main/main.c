@@ -33,8 +33,8 @@
 // ----- Task parameters -----
 
 // Cyclic executive frame constants
-#define FRAME_US        10000LL   // minor frame = Task A period (10 ms)
-#define SLOTS_PER_CYCLE 10u       // major cycle = hyperperiod = 100 ms
+#define FRAME_US        10000LL   //  Task A period (10 ms)
+#define SLOTS_PER_CYCLE 10u       // hyperperiod = 100 ms
 
 // Sporadic guard: only start task S if enough slack remains before the next frame boundary
 #define SPORADIC_WCET_US   2600LL  // S WorkKernel budget (600000 / 240 MHz) + overhead margin
