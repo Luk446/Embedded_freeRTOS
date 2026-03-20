@@ -1,17 +1,17 @@
 // ----- Includes ----
 
 #include <inttypes.h>
-#include <stdbool.h> // bools 
+#include <stdbool.h> // boolean type
 #include <stdint.h>
-#include <stdio.h> // printing
+#include <stdio.h> // printf logging
 
 #include "driver/gpio.h" // hardware control
+#include "driver/pulse_cnt.h" // hardware pulse counter (PCNT)
 #include "esp_attr.h"
 #include "esp_err.h"
 #include "esp_log.h" // monitor logging
 #include "esp_timer.h"
 #include "monitor.h"
-#include "esp_task_wdt.h" // manage watchdog for debug
 
 // ----- Pin definitions -----
 
@@ -32,15 +32,15 @@
 
 // ----- Task parameters -----
 
-// Periods in microseconds
-#define PERIOD_A_US 10000LL
-#define PERIOD_B_US 20000LL
-#define PERIOD_AGG_US 20000LL
-#define PERIOD_C_US 50000LL
-#define PERIOD_D_US 50000LL
+// Cyclic executive frame constants
+#define FRAME_US        10000LL   //  Task A period (10 ms)
+#define SLOTS_PER_CYCLE 10u       // hyperperiod = 100 ms
 
-// scheduling logic constants
-#define SPORADIC_SLACK_GUARD_US 3000LL
+// Sporadic guard: only start task S if enough slack remains before the next frame boundary
+#define SPORADIC_WCET_US   2600LL  // S WorkKernel budget (600000 / 240 MHz) + overhead margin
+#define FRAME_GUARD_US      300LL  // extra safety margin before frame boundary
+#define MONITOR_LINE_BUDGET_US 6500LL // one monitor line at 115200 baud with margin
+
 #define AGG_FALLBACK_TOKEN 0xDEADBEEFu
 
 // work kernel budgets from the docs (conditional on device)
@@ -51,10 +51,25 @@
 #define BUDGET_D_CYCLES 960000u
 #define BUDGET_S_CYCLES 600000u
 
+// Timing-focused mode: disable high-rate UART task logs by default.
+// Set to 1 when you need per-job functional UART traces.
+#define TASK_UART_LOG_ENABLED 0
+
+// Local scheduler-friendly monitor cadence in seconds.
+#define SCHED_MONITOR_REPORT_EVERY_S 4u
+
+#if TASK_UART_LOG_ENABLED
+#define TASK_LOG(...) printf(__VA_ARGS__)
+#define TASK_LOG_USE(v) do { } while (0)
+#else
+#define TASK_LOG(...) do { } while (0)
+#define TASK_LOG_USE(v) do { (void)(v); } while (0)
+#endif
+
 
 static const char *TAG = "assignment2";
 
-// delcare the work kernel
+// declare the work kernel
 uint32_t WorkKernel(uint32_t budget_cycles, uint32_t seed);
 
 // ----- State variables -----
@@ -70,17 +85,6 @@ typedef struct {
     uint32_t idx_d;
     uint32_t idx_s;
 
-    // edge counts
-    uint32_t last_edge_count_a;
-    uint32_t last_edge_count_b;
-
-    // next release times
-    int64_t next_a_us;
-    int64_t next_b_us;
-    int64_t next_agg_us;
-    int64_t next_c_us;
-    int64_t next_d_us;
-
     // validity tokens
     bool token_a_valid;
     bool token_b_valid;
@@ -89,18 +93,69 @@ typedef struct {
 
 } sched_state_t;
 
-// global instannce of the scheduler state
+// global instance of the scheduler state
 static sched_state_t g_state;
 
+// edge counts latched at the frame boundary and consumed by task_a() / task_b()
+static uint32_t g_latched_count_a = 0u;
+static uint32_t g_latched_count_b = 0u;
+
+// PCNT unit handles and previous-count baselines for delta calculation
+static pcnt_unit_handle_t g_pcnt_unit_a = NULL;
+static pcnt_unit_handle_t g_pcnt_unit_b = NULL;
+static int g_pcnt_prev_a = 0;
+static int g_pcnt_prev_b = 0;
+static uint32_t g_frame_overrun_count = 0u;
+static int64_t g_last_overrun_log_us = 0;
+
+typedef struct {
+    const char *name;
+    int64_t deadline_us;
+    uint32_t jobs;
+    uint32_t misses;
+    int64_t start_us;
+    int64_t release_us;
+    int64_t max_exec_us;
+    int64_t worst_late_us;
+    bool active;
+} sched_monitor_task_t;
+
+typedef struct {
+    int64_t t0_us;
+    sched_monitor_task_t a;
+    sched_monitor_task_t b;
+    sched_monitor_task_t agg;
+    sched_monitor_task_t c;
+    sched_monitor_task_t d;
+    sched_monitor_task_t s;
+} sched_monitor_snapshot_t;
+
+static sched_monitor_task_t g_mon_a = {.name = "A", .deadline_us = 10000};
+static sched_monitor_task_t g_mon_b = {.name = "B", .deadline_us = 20000};
+static sched_monitor_task_t g_mon_agg = {.name = "AGG", .deadline_us = 20000};
+static sched_monitor_task_t g_mon_c = {.name = "C", .deadline_us = 50000};
+static sched_monitor_task_t g_mon_d = {.name = "D", .deadline_us = 50000};
+static sched_monitor_task_t g_mon_s = {.name = "S", .deadline_us = 30000};
+
+static sched_monitor_snapshot_t g_mon_snapshot;
+static int64_t g_mon_t0_us = 0;
+static int64_t g_mon_next_report_us = 0;
+static bool g_mon_report_pending = false;
+static uint32_t g_mon_report_line = 0;
+
+#define LOCAL_S_RELEASE_Q_MAX 32
+static volatile int64_t g_local_s_release_q[LOCAL_S_RELEASE_Q_MAX];
+static volatile uint32_t g_local_s_release_q_head = 0;
+static volatile uint32_t g_local_s_release_q_tail = 0;
+static volatile uint32_t g_local_s_release_q_count = 0;
+
 // global variables shared between loop and interrupts
-static volatile uint32_t g_edge_count_a = 0;
-static volatile uint32_t g_edge_count_b = 0;
 static volatile uint32_t g_pending_s = 0;
 static volatile uint32_t g_sync_time_us = 0;
 static volatile bool g_sync_seen = false;
 static volatile bool g_schedule_started = false;
 
-// ----- interrupt service routines and helpers ----
+// ----- Interrupt service routines and helpers ----
 
 // helper functions for GPIO control and time
 
@@ -119,19 +174,173 @@ static inline int64_t now_us(void)
     return esp_timer_get_time();
 }
 
-// ISRs for each input pin (using esp32 internal ram) and atomic built ins for safe shared variable access between ISRs and main loop
-
-static void IRAM_ATTR isr_in_a(void *arg)
+static void sched_monitor_reset_task(sched_monitor_task_t *task)
 {
-    (void)arg;
-    __atomic_fetch_add(&g_edge_count_a, 1u, __ATOMIC_RELAXED);
+    task->jobs = 0;
+    task->misses = 0;
+    task->start_us = 0;
+    task->release_us = 0;
+    task->max_exec_us = 0;
+    task->worst_late_us = 0;
+    task->active = false;
 }
 
-static void IRAM_ATTR isr_in_b(void *arg)
+static void sched_monitor_reset(int64_t t0_us)
 {
-    (void)arg;
-    __atomic_fetch_add(&g_edge_count_b, 1u, __ATOMIC_RELAXED);
+    g_mon_t0_us = t0_us;
+    sched_monitor_reset_task(&g_mon_a);
+    sched_monitor_reset_task(&g_mon_b);
+    sched_monitor_reset_task(&g_mon_agg);
+    sched_monitor_reset_task(&g_mon_c);
+    sched_monitor_reset_task(&g_mon_d);
+    sched_monitor_reset_task(&g_mon_s);
+    g_mon_report_pending = false;
+    g_mon_report_line = 0;
+    g_mon_next_report_us = (SCHED_MONITOR_REPORT_EVERY_S == 0u)
+        ? 0
+        : (t0_us + ((int64_t)SCHED_MONITOR_REPORT_EVERY_S * 1000000LL));
+    g_local_s_release_q_head = 0;
+    g_local_s_release_q_tail = 0;
+    g_local_s_release_q_count = 0;
+}                       
+
+static void sched_monitor_begin_task(sched_monitor_task_t *task, int64_t release_us)
+{
+    task->active = true;
+    task->release_us = release_us;
+    task->start_us = now_us();
 }
+
+static void sched_monitor_end_task(sched_monitor_task_t *task)
+{
+    if (!task->active) {
+        return;
+    }
+
+    const int64_t end_us = now_us();
+    const int64_t exec_us = end_us - task->start_us;
+    const int64_t late_us = end_us - (task->release_us + task->deadline_us);
+
+    if (exec_us > task->max_exec_us) {
+        task->max_exec_us = exec_us;
+    }
+    if (late_us > task->worst_late_us) {
+        task->worst_late_us = late_us;
+    }
+
+    task->jobs++;
+    if (late_us > 0) {
+        task->misses++;
+    }
+
+    task->active = false;
+}
+
+static void sched_monitor_capture_snapshot(void)
+{
+    g_mon_snapshot.t0_us = g_mon_t0_us;
+    g_mon_snapshot.a = g_mon_a;
+    g_mon_snapshot.b = g_mon_b;
+    g_mon_snapshot.agg = g_mon_agg;
+    g_mon_snapshot.c = g_mon_c;
+    g_mon_snapshot.d = g_mon_d;
+    g_mon_snapshot.s = g_mon_s;
+    g_mon_report_pending = true;
+    g_mon_report_line = 0;
+}
+
+static void sched_monitor_queue_due_report(void)
+{
+    if (g_mon_next_report_us == 0) {
+        return;
+    }
+
+    const int64_t now = now_us();
+    if (now < g_mon_next_report_us) {
+        return;
+    }
+
+    const int64_t period_us = (int64_t)SCHED_MONITOR_REPORT_EVERY_S * 1000000LL;
+    const int64_t missed_periods = (now - g_mon_next_report_us) / period_us;
+    g_mon_next_report_us += (missed_periods + 1) * period_us;
+
+    if (!g_mon_report_pending) {
+        sched_monitor_capture_snapshot();
+    }
+}
+
+static void sched_monitor_print_task(const sched_monitor_task_t *task)
+{
+    printf("[MON] %s jobs=%" PRIu32 " misses=%" PRIu32 " max_exec=%" PRIi64
+           "us worst_late=%" PRIi64 "us\n",
+           task->name, task->jobs, task->misses, task->max_exec_us, task->worst_late_us);
+}
+
+static void sched_monitor_service_line(int64_t frame_end_us)
+{
+    if (!g_mon_report_pending) {
+        return;
+    }
+
+    if ((frame_end_us - now_us()) < (MONITOR_LINE_BUDGET_US + FRAME_GUARD_US)) {
+        return;
+    }
+
+    switch (g_mon_report_line) {
+        case 0:
+            printf("[MON] T0=%" PRIi64 " us\n", g_mon_snapshot.t0_us);
+            break;
+        case 1:
+            sched_monitor_print_task(&g_mon_snapshot.a);
+            break;
+        case 2:
+            sched_monitor_print_task(&g_mon_snapshot.b);
+            break;
+        case 3:
+            sched_monitor_print_task(&g_mon_snapshot.agg);
+            break;
+        case 4:
+            sched_monitor_print_task(&g_mon_snapshot.c);
+            break;
+        case 5:
+            sched_monitor_print_task(&g_mon_snapshot.d);
+            break;
+        case 6:
+            sched_monitor_print_task(&g_mon_snapshot.s);
+            g_mon_report_pending = false;
+            g_mon_report_line = 0;
+            return;
+        default:
+            g_mon_report_pending = false;
+            g_mon_report_line = 0;
+            return;
+    }
+
+    g_mon_report_line++;
+}
+
+static void IRAM_ATTR sched_monitor_notify_s_release(void)
+{
+    const int64_t release_us = esp_timer_get_time();
+    if (g_local_s_release_q_count < LOCAL_S_RELEASE_Q_MAX) {
+        g_local_s_release_q[g_local_s_release_q_tail] = release_us;
+        g_local_s_release_q_tail = (g_local_s_release_q_tail + 1u) % LOCAL_S_RELEASE_Q_MAX;
+        g_local_s_release_q_count++;
+    }
+}
+
+static int64_t sched_monitor_take_s_release(void)
+{
+    int64_t release_us = now_us();
+    if (g_local_s_release_q_count > 0u) {
+        release_us = g_local_s_release_q[g_local_s_release_q_head];
+        g_local_s_release_q_head = (g_local_s_release_q_head + 1u) % LOCAL_S_RELEASE_Q_MAX;
+        g_local_s_release_q_count--;
+    }
+    return release_us;
+}
+
+// ISR for sporadic task release (IN_S) - edge counting for A and B is done in hardware (PCNT)
 
 static void IRAM_ATTR isr_in_s(void *arg)
 {
@@ -142,6 +351,7 @@ static void IRAM_ATTR isr_in_s(void *arg)
     }
 
     __atomic_fetch_add(&g_pending_s, 1u, __ATOMIC_RELAXED);
+    sched_monitor_notify_s_release();
     notifySRelease();
 }
 
@@ -157,16 +367,15 @@ static void IRAM_ATTR isr_sync(void *arg)
     __atomic_store_n(&g_sync_seen, true, __ATOMIC_RELEASE);
 }
 
-// ----- GPIO init and scheduler setup -----
+// ----- GPIO/PCNT init and scheduler setup -----
 
-// configure pins for input and output, set pull modes, initialize ACKs to low, and set up interrupts for inputs
+// Configure SYNC/S input GPIOs, ACK outputs, and ISR hooks for SYNC and IN_S.
+// IN_A and IN_B are configured by the PCNT driver in pcnt_init().
 static void gpio_init(void)
 {
-    // configure input pins
+    // configure input pins (IN_A and IN_B are owned by the PCNT driver)
     const gpio_config_t input_conf = {
         .pin_bit_mask = (1ULL << PIN_SYNC) |
-                        (1ULL << PIN_IN_A) |
-                        (1ULL << PIN_IN_B) |
                         (1ULL << PIN_IN_S) |
                         (1ULL << PIN_IN_MODE),
         .mode = GPIO_MODE_INPUT,
@@ -193,12 +402,10 @@ static void gpio_init(void)
     ESP_ERROR_CHECK(gpio_config(&input_conf));
     ESP_ERROR_CHECK(gpio_config(&output_conf));
 
-    // set pull modes
+    // set pull modes (IN_A and IN_B pull modes are configured by the PCNT driver)
     ESP_ERROR_CHECK(gpio_set_pull_mode(PIN_SYNC, GPIO_PULLDOWN_ONLY));
     ESP_ERROR_CHECK(gpio_set_pull_mode(PIN_IN_S, GPIO_PULLDOWN_ONLY));
     ESP_ERROR_CHECK(gpio_set_pull_mode(PIN_IN_MODE, GPIO_PULLDOWN_ONLY));
-    ESP_ERROR_CHECK(gpio_set_pull_mode(PIN_IN_A, GPIO_FLOATING));
-    ESP_ERROR_CHECK(gpio_set_pull_mode(PIN_IN_B, GPIO_FLOATING));
 
     // initialize ACKs to low
     ack_low(ACK_A);
@@ -208,21 +415,72 @@ static void gpio_init(void)
     ack_low(ACK_D);
     ack_low(ACK_S);
 
-    // set up interrupts for inputs
+    // set up interrupts for SYNC and IN_S (IN_A and IN_B are counted by PCNT hardware)
     ESP_ERROR_CHECK(gpio_install_isr_service(ESP_INTR_FLAG_IRAM));
     ESP_ERROR_CHECK(gpio_set_intr_type(PIN_SYNC, GPIO_INTR_POSEDGE));
-    ESP_ERROR_CHECK(gpio_set_intr_type(PIN_IN_A, GPIO_INTR_POSEDGE));
-    ESP_ERROR_CHECK(gpio_set_intr_type(PIN_IN_B, GPIO_INTR_POSEDGE));
     ESP_ERROR_CHECK(gpio_set_intr_type(PIN_IN_S, GPIO_INTR_POSEDGE));
 
     // attach ISRs
     ESP_ERROR_CHECK(gpio_isr_handler_add(PIN_SYNC, isr_sync, NULL));
-    ESP_ERROR_CHECK(gpio_isr_handler_add(PIN_IN_A, isr_in_a, NULL));
-    ESP_ERROR_CHECK(gpio_isr_handler_add(PIN_IN_B, isr_in_b, NULL));
     ESP_ERROR_CHECK(gpio_isr_handler_add(PIN_IN_S, isr_in_s, NULL));
 }
 
-// block the program starting until the rising edge from the sync pin (button) is seen 
+// configure two PCNT units to count rising edges on IN_A and IN_B in hardware
+static void pcnt_init(void)
+{
+    // accum_count=1: the driver accumulates overflows so pcnt_unit_get_count() returns a
+    // monotonically increasing total rather than a raw 16-bit value that wraps
+    const pcnt_unit_config_t unit_cfg = {
+        .low_limit  = -1,
+        .high_limit = 30000,
+        .flags      = { .accum_count = 1 },
+    };
+    ESP_ERROR_CHECK(pcnt_new_unit(&unit_cfg, &g_pcnt_unit_a));
+    ESP_ERROR_CHECK(pcnt_new_unit(&unit_cfg, &g_pcnt_unit_b));
+
+    // 1 us glitch filter: reject narrow noise pulses but keep valid square-wave edges
+    const pcnt_glitch_filter_config_t filter_cfg = { .max_glitch_ns = 1000 };
+    ESP_ERROR_CHECK(pcnt_unit_set_glitch_filter(g_pcnt_unit_a, &filter_cfg));
+    ESP_ERROR_CHECK(pcnt_unit_set_glitch_filter(g_pcnt_unit_b, &filter_cfg));
+
+    // channel A: increment on rising edge of PIN_IN_A, hold on falling edge
+    const pcnt_chan_config_t chan_a_cfg = {
+        .edge_gpio_num  = PIN_IN_A,
+        .level_gpio_num = -1,
+    };
+    pcnt_channel_handle_t chan_a;
+    ESP_ERROR_CHECK(pcnt_new_channel(g_pcnt_unit_a, &chan_a_cfg, &chan_a));
+    ESP_ERROR_CHECK(pcnt_channel_set_edge_action(chan_a,
+                                                 PCNT_CHANNEL_EDGE_ACTION_INCREASE,
+                                                 PCNT_CHANNEL_EDGE_ACTION_HOLD));
+    ESP_ERROR_CHECK(pcnt_channel_set_level_action(chan_a,
+                                                  PCNT_CHANNEL_LEVEL_ACTION_KEEP,
+                                                  PCNT_CHANNEL_LEVEL_ACTION_KEEP));
+
+    // channel B: increment on rising edge of PIN_IN_B, hold on falling edge
+    const pcnt_chan_config_t chan_b_cfg = {
+        .edge_gpio_num  = PIN_IN_B,
+        .level_gpio_num = -1,
+    };
+    pcnt_channel_handle_t chan_b;
+    ESP_ERROR_CHECK(pcnt_new_channel(g_pcnt_unit_b, &chan_b_cfg, &chan_b));
+    ESP_ERROR_CHECK(pcnt_channel_set_edge_action(chan_b,
+                                                 PCNT_CHANNEL_EDGE_ACTION_INCREASE,
+                                                 PCNT_CHANNEL_EDGE_ACTION_HOLD));
+    ESP_ERROR_CHECK(pcnt_channel_set_level_action(chan_b,
+                                                  PCNT_CHANNEL_LEVEL_ACTION_KEEP,
+                                                  PCNT_CHANNEL_LEVEL_ACTION_KEEP));
+
+    // zero counters, then start both units
+    ESP_ERROR_CHECK(pcnt_unit_enable(g_pcnt_unit_a));
+    ESP_ERROR_CHECK(pcnt_unit_enable(g_pcnt_unit_b));
+    ESP_ERROR_CHECK(pcnt_unit_clear_count(g_pcnt_unit_a));
+    ESP_ERROR_CHECK(pcnt_unit_clear_count(g_pcnt_unit_b));
+    ESP_ERROR_CHECK(pcnt_unit_start(g_pcnt_unit_a));
+    ESP_ERROR_CHECK(pcnt_unit_start(g_pcnt_unit_b));
+}
+
+// Block until the first SYNC rising edge and return its timestamp.
 static int64_t wait_for_sync_rising_edge(void)
 {
     __atomic_store_n(&g_sync_seen, false, __ATOMIC_RELEASE);
@@ -236,9 +494,7 @@ static int64_t wait_for_sync_rising_edge(void)
     return (int64_t)__atomic_load_n(&g_sync_time_us, __ATOMIC_ACQUIRE);
 }
 
-// now once the T0 time is obtained from the sync signal, initialize the scheduler state and variables to be ready for the main loop scheduling logic
-
-// initialize the scheduler 
+// Initialize scheduler counters and tokens for a new run at T0.
 static void reset_schedule_state(int64_t t0_us)
 {
     g_state.idx_a = 0;
@@ -247,37 +503,44 @@ static void reset_schedule_state(int64_t t0_us)
     g_state.idx_c = 0;
     g_state.idx_d = 0;
     g_state.idx_s = 0;
-    g_state.last_edge_count_a = __atomic_load_n(&g_edge_count_a, __ATOMIC_RELAXED);
-    g_state.last_edge_count_b = __atomic_load_n(&g_edge_count_b, __ATOMIC_RELAXED);
-    g_state.next_a_us = t0_us;
-    g_state.next_b_us = t0_us;
-    g_state.next_agg_us = t0_us;
-    g_state.next_c_us = t0_us;
-    g_state.next_d_us = t0_us;
+    // Reset PCNT counters and baselines so the first counting window starts cleanly at T0
+    ESP_ERROR_CHECK(pcnt_unit_clear_count(g_pcnt_unit_a));
+    ESP_ERROR_CHECK(pcnt_unit_clear_count(g_pcnt_unit_b));
+    g_pcnt_prev_a = 0;
+    g_pcnt_prev_b = 0;
+    g_latched_count_a = 0u;
+    g_latched_count_b = 0u;
     g_state.token_a_valid = false;
     g_state.token_b_valid = false;
     g_state.token_a = 0;
     g_state.token_b = 0;
+    g_frame_overrun_count = 0u;
+    g_last_overrun_log_us = t0_us;
+    sched_monitor_reset(t0_us);
     __atomic_store_n(&g_pending_s, 0u, __ATOMIC_RELAXED);
 }
 
-// 
+// Read PCNT hardware count and return the delta since the last call (delta-per-period method).
+// Bounded O(1) execution: one register read and one integer subtraction, no CPU ISR overhead.
 static uint32_t edge_count_a_last_period(void)
 {
-    const uint32_t total = __atomic_load_n(&g_edge_count_a, __ATOMIC_RELAXED);
-    const uint32_t delta = total - g_state.last_edge_count_a;
-    g_state.last_edge_count_a = total;
+    int current = 0;
+    pcnt_unit_get_count(g_pcnt_unit_a, &current);
+    const uint32_t delta = (uint32_t)(current - g_pcnt_prev_a);
+    g_pcnt_prev_a = current;
     return delta;
 }
 
 static uint32_t edge_count_b_last_period(void)
 {
-    const uint32_t total = __atomic_load_n(&g_edge_count_b, __ATOMIC_RELAXED);
-    const uint32_t delta = total - g_state.last_edge_count_b;
-    g_state.last_edge_count_b = total;
+    int current = 0;
+    pcnt_unit_get_count(g_pcnt_unit_b, &current);
+    const uint32_t delta = (uint32_t)(current - g_pcnt_prev_b);
+    g_pcnt_prev_b = current;
     return delta;
 }
 
+// attempt to take a sporadic release
 static bool try_take_sporadic_release(void)
 {
     uint32_t pending = __atomic_load_n(&g_pending_s, __ATOMIC_ACQUIRE);
@@ -296,82 +559,58 @@ static bool try_take_sporadic_release(void)
     return false;
 }
 
-static int64_t next_periodic_release_us(void)
-{
-    int64_t next_release = g_state.next_a_us;
-
-    if (g_state.next_b_us < next_release) {
-        next_release = g_state.next_b_us;
-    }
-    if (g_state.next_agg_us < next_release) {
-        next_release = g_state.next_agg_us;
-    }
-    if (g_state.next_c_us < next_release) {
-        next_release = g_state.next_c_us;
-    }
-    if (g_state.next_d_us < next_release) {
-        next_release = g_state.next_d_us;
-    }
-
-    return next_release;
-}
-
-static bool should_run_sporadic(int64_t now)
-{
-    if (__atomic_load_n(&g_pending_s, __ATOMIC_ACQUIRE) == 0u) {
-        return false;
-    }
-
-    return (next_periodic_release_us() - now) > SPORADIC_SLACK_GUARD_US;
-}
-
 // ----- Task implementations -----
 
-/*for each task :
-- get current task id
-- perform task specific calcs 
-- calc the seed val
-- signal start of task with monitor and ACK high
-- run the work kernel for the task's budget and seed
-- signal end of task with monitor and ACK low
-- update the global state of task 
-- print the results to serial monitor
+/*
+Task execution pattern used by each periodic/sporadic task:
+- read current task index and derive seed inputs
+- assert ACK and notify monitor task-begin
+- execute WorkKernel() with the task budget
+- deassert ACK and notify monitor task-end
+- update shared token state (where relevant)
+- print UART log line for tester validation
 */
 static void task_a(void)
 {
     const uint32_t id = g_state.idx_a;
-    const uint32_t count_a = edge_count_a_last_period();
+    const uint32_t count_a = g_latched_count_a;  // sampled at frame boundary
     const uint32_t seed = (id << 16) ^ count_a ^ 0xA1u;
+    const int64_t release_us = g_mon_t0_us + ((int64_t)id * FRAME_US);
 
+    sched_monitor_begin_task(&g_mon_a, release_us);
     beginTaskA(id);
     ack_high(ACK_A);
     const uint32_t token = WorkKernel(BUDGET_A_CYCLES, seed);
     ack_low(ACK_A);
     endTaskA();
+    sched_monitor_end_task(&g_mon_a);
 
     g_state.token_a = token;
     g_state.token_a_valid = true;
 
-    printf("A,%" PRIu32 ",%" PRIu32 ",%" PRIu32 "\n", id, count_a, token);
+    TASK_LOG("A,%" PRIu32 ",%" PRIu32 ",%" PRIu32 "\n", id, count_a, token);
 }
 
 
 static void task_b(void)
 {
     const uint32_t id = g_state.idx_b;
-    const uint32_t count_b = edge_count_b_last_period();
+    const uint32_t count_b = g_latched_count_b;  // sampled at frame boundary
     const uint32_t seed = (id << 16) ^ count_b ^ 0xB2u;
+    const int64_t release_us = g_mon_t0_us + ((int64_t)id * 20000LL);
 
+    sched_monitor_begin_task(&g_mon_b, release_us);
     beginTaskB(id);
     ack_high(ACK_B);
     const uint32_t token = WorkKernel(BUDGET_B_CYCLES, seed);
     ack_low(ACK_B);
     endTaskB();
+    sched_monitor_end_task(&g_mon_b);
 
     g_state.token_b = token;
     g_state.token_b_valid = true;
 
-    printf("B,%" PRIu32 ",%" PRIu32 ",%" PRIu32 "\n", id, count_b, token);
+    TASK_LOG("B,%" PRIu32 ",%" PRIu32 ",%" PRIu32 "\n", id, count_b, token);
 }
 
 static void task_agg(void)
@@ -381,69 +620,141 @@ static void task_agg(void)
                              ? (g_state.token_a ^ g_state.token_b)
                              : AGG_FALLBACK_TOKEN;
     const uint32_t seed = (id << 16) ^ agg ^ 0xD4u;
+    const int64_t release_us = g_mon_t0_us + ((int64_t)id * 20000LL);
 
+    sched_monitor_begin_task(&g_mon_agg, release_us);
     beginTaskAGG(id);
     ack_high(ACK_AGG);
     const uint32_t token = WorkKernel(BUDGET_AGG_CYCLES, seed);
     ack_low(ACK_AGG);
     endTaskAGG();
+    sched_monitor_end_task(&g_mon_agg);
 
-    printf("AGG,%" PRIu32 ",%" PRIu32 ",%" PRIu32 "\n", id, agg, token);
+    TASK_LOG_USE(token);
+    TASK_LOG("AGG,%" PRIu32 ",%" PRIu32 ",%" PRIu32 "\n", id, agg, token);
 }
 
 static void task_c(void)
 {
     const uint32_t id = g_state.idx_c;
     const uint32_t seed = (id << 16) ^ 0xC3u;
+    const int64_t release_us = g_mon_t0_us + ((int64_t)id * 50000LL);
 
+    sched_monitor_begin_task(&g_mon_c, release_us);
     beginTaskC(id);
     ack_high(ACK_C);
     const uint32_t token = WorkKernel(BUDGET_C_CYCLES, seed);
     ack_low(ACK_C);
     endTaskC();
+    sched_monitor_end_task(&g_mon_c);
 
-    printf("C,%" PRIu32 ",%" PRIu32 "\n", id, token);
+    TASK_LOG_USE(token);
+    TASK_LOG("C,%" PRIu32 ",%" PRIu32 "\n", id, token);
 }
 
 static void task_d(void)
 {
     const uint32_t id = g_state.idx_d;
     const uint32_t seed = (id << 16) ^ 0xD5u;
+    const int64_t release_us = g_mon_t0_us + ((int64_t)id * 50000LL);
 
+    sched_monitor_begin_task(&g_mon_d, release_us);
     beginTaskD(id);
     ack_high(ACK_D);
     const uint32_t token = WorkKernel(BUDGET_D_CYCLES, seed);
     ack_low(ACK_D);
     endTaskD();
+    sched_monitor_end_task(&g_mon_d);
 
-    printf("D,%" PRIu32 ",%" PRIu32 "\n", id, token);
+    TASK_LOG_USE(token);
+    TASK_LOG("D,%" PRIu32 ",%" PRIu32 "\n", id, token);
 }
 
 static void task_s(void)
 {
     const uint32_t id = g_state.idx_s;
     const uint32_t seed = (id << 16) ^ 0x55u;
+    const int64_t release_us = sched_monitor_take_s_release();
 
+    sched_monitor_begin_task(&g_mon_s, release_us);
     beginTaskS(id);
     ack_high(ACK_S);
     const uint32_t token = WorkKernel(BUDGET_S_CYCLES, seed);
     ack_low(ACK_S);
     endTaskS();
+    sched_monitor_end_task(&g_mon_s);
 
-    printf("S,%" PRIu32 ",%" PRIu32 "\n", id, token);
+    TASK_LOG_USE(token);
+    TASK_LOG("S,%" PRIu32 ",%" PRIu32 "\n", id, token);
 }
 
-// ----- Main (super) loop -----
+// ----- Cyclic executive frame dispatch -----
+
+// Latch edge-count deltas at the start of each frame, before any task runs.
+// A: every frame (10 ms period).
+// B: every even frame (20 ms period) so the delta window is exactly 20 ms.
+static void latch_counts_for_slot(uint32_t slot)
+{
+    g_latched_count_a = edge_count_a_last_period();
+    if ((slot & 1u) == 0u) {
+        g_latched_count_b = edge_count_b_last_period();
+    }
+}
+
+// Fixed slot dispatch for the 100 ms major cycle (10 frames x 10 ms).
+//
+// Frame layout:
+//   0: A, B, AGG   B@0  released t=  0 ms, deadline t= 20 ms
+//   1: A, C        C@0  released t=  0 ms, deadline t= 50 ms
+//   2: A, B, AGG   B@1  released t= 20 ms, deadline t= 40 ms
+//   3: A, D        D@0  released t=  0 ms, deadline t= 50 ms  (slack for S)
+//   4: A, B, AGG   B@2  released t= 40 ms, deadline t= 60 ms
+//   5: A           (free frame - maximum slack for S)
+//   6: A, B, AGG   B@3  released t= 60 ms, deadline t= 80 ms
+//   7: A, C        C@1  released t= 50 ms, deadline t=100 ms
+//   8: A, B, AGG   B@4  released t= 80 ms, deadline t=100 ms
+//   9: A, D        D@1  released t= 50 ms, deadline t=100 ms  (slack for S)
+static void run_slot(uint32_t slot)
+{
+    switch (slot) {
+        case 0: task_a(); g_state.idx_a++; task_b(); g_state.idx_b++; task_agg(); g_state.idx_agg++; break;
+        case 1: task_a(); g_state.idx_a++; task_c(); g_state.idx_c++;                                 break;
+        case 2: task_a(); g_state.idx_a++; task_b(); g_state.idx_b++; task_agg(); g_state.idx_agg++; break;
+        case 3: task_a(); g_state.idx_a++; task_d(); g_state.idx_d++;                                 break;
+        case 4: task_a(); g_state.idx_a++; task_b(); g_state.idx_b++; task_agg(); g_state.idx_agg++; break;
+        case 5: task_a(); g_state.idx_a++;                                                             break;
+        case 6: task_a(); g_state.idx_a++; task_b(); g_state.idx_b++; task_agg(); g_state.idx_agg++; break;
+        case 7: task_a(); g_state.idx_a++; task_c(); g_state.idx_c++;                                 break;
+        case 8: task_a(); g_state.idx_a++; task_b(); g_state.idx_b++; task_agg(); g_state.idx_agg++; break;
+        case 9: task_a(); g_state.idx_a++; task_d(); g_state.idx_d++;                                 break;
+        default: break;
+    }
+}
+
+// Run pending sporadic jobs while there is enough slack before the next frame boundary.
+static void run_sporadic_if_budget(int64_t frame_end_us)
+{
+    while (__atomic_load_n(&g_pending_s, __ATOMIC_ACQUIRE) > 0u) {
+        if ((frame_end_us - now_us()) < (SPORADIC_WCET_US + FRAME_GUARD_US)) {
+            break;
+        }
+        if (!try_take_sporadic_release()) {
+            break;
+        }
+        task_s();
+        g_state.idx_s++;
+    }
+}
+
+// ----- Main (cyclic executive) loop -----
 
 
 void app_main(void)
 {
-    esp_task_wdt_deinit(); // disable task watchdog timer for testing
     monitorInit(); // initialize the monitor
-    monitorSetPeriodicReportEverySeconds(4); // enable periodic reporting every n seconds
-    monitorSetFinalReportAfterSeconds(0); // disable final report timer
 
-    gpio_init(); // initialize GPIOs and interrupts
+    gpio_init(); // initialize GPIOs and SYNC/IN_S interrupts
+    pcnt_init(); // start hardware edge counters for IN_A and IN_B
 
     ESP_LOGI(TAG, "Waiting for SYNC"); // wait for the sync signal to start the scheduler and get the T0 time
     const int64_t t0_us = wait_for_sync_rising_edge(); // init scheduler state with T0 and start main loop
@@ -453,56 +764,51 @@ void app_main(void)
 
     ESP_LOGI(TAG, "Assignment 2 super-loop started at T0=%" PRIi64 " us", t0_us); // log the start of the super-loop
 
-    // super loop scheduling
-    /* for each task check if the time is past the next release time for that task - if it is , task function is called and the next release time for that task is updated based on its period. 
-    */
+    // Cyclic executive: advance one 10 ms frame at a time, dispatching tasks by
+    // their fixed slot in the 100 ms major cycle.
+    uint32_t frame_counter = 0u;
+    int64_t next_frame_start = t0_us;
+
     while (true) {
-        int64_t now = now_us();
+        // wait for the start of this frame
+        while (now_us() < next_frame_start) {}
 
-        while (now >= g_state.next_a_us) {
-            task_a();
-            g_state.idx_a++;
-            g_state.next_a_us += PERIOD_A_US;
-            now = now_us();
+        const uint32_t slot       = frame_counter % SLOTS_PER_CYCLE;
+        const int64_t  frame_end  = next_frame_start + FRAME_US;
+
+        // latch edge counts before any task runs this frame
+        latch_counts_for_slot(slot);
+
+        // run the periodic tasks assigned to this slot
+        run_slot(slot);
+
+        // use remaining frame slack for any pending sporadic jobs
+        run_sporadic_if_budget(frame_end);
+
+        // Queue and drain one local monitor line from the free frame.
+        sched_monitor_queue_due_report();
+        if (slot == 5u) {
+            sched_monitor_service_line(frame_end);
         }
 
-        while (now >= g_state.next_b_us) {
-            task_b();
-            g_state.idx_b++;
-            g_state.next_b_us += PERIOD_B_US;
-            now = now_us();
+        // detect frame overrun (logged before the idle busy-wait)
+        const int64_t now_after = now_us();
+        if (now_after > frame_end) {
+            g_frame_overrun_count++;
+
+            // Throttle overrun logs: printing every frame causes a feedback loop that
+            // can dominate CPU time and worsen deadline misses.
+            if ((now_after - g_last_overrun_log_us) >= 1000000LL) {
+                ESP_LOGW(TAG, "Frame overruns=%" PRIu32 ", last slot=%" PRIu32 ", last over=%" PRIi64 " us",
+                         g_frame_overrun_count, slot, now_after - frame_end);
+                g_last_overrun_log_us = now_after;
+            }
         }
 
-        while (now >= g_state.next_agg_us) {
-            task_agg();
-            g_state.idx_agg++;
-            g_state.next_agg_us += PERIOD_AGG_US;
-            now = now_us();
-        }
+        // idle until the frame boundary
+        while (now_us() < frame_end) {}
 
-        while (now >= g_state.next_c_us) {
-            task_c();
-            g_state.idx_c++;
-            g_state.next_c_us += PERIOD_C_US;
-            now = now_us();
-        }
-
-        while (now >= g_state.next_d_us) {
-            task_d();
-            g_state.idx_d++;
-            g_state.next_d_us += PERIOD_D_US;
-            now = now_us();
-        }
-
-        now = now_us();
-        if (should_run_sporadic(now) && try_take_sporadic_release()) {
-            task_s();
-            g_state.idx_s++;
-            continue;
-        }
-
-        if (monitorPollReports()) {
-            ESP_LOGI(TAG, "Final monitor report printed");
-        }
+        frame_counter++;
+        next_frame_start += FRAME_US;
     }
 }

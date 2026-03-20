@@ -1,64 +1,76 @@
 flowchart TD
-	A[app_main starts] --> B[Disable task watchdog]
-	B --> C[monitorInit and monitor report config]
-	C --> D[gpio_init: configure pins and ISRs]
-	D --> E[Wait for SYNC rising edge]
+	A[app_main starts] --> B[monitorInit]
+	B --> C[gpio_init<br/>configure SYNC and IN_S ISRs<br/>configure ACK outputs]
+	C --> D[pcnt_init<br/>start hardware edge counters for IN_A and IN_B]
+	D --> E[Wait for first SYNC rising edge]
 	E --> F[Capture T0]
-	F --> G[reset_schedule_state T0]
-	G --> H[synch monitor and set schedule_started true]
-	H --> I[Enter super loop]
+	F --> G[reset_schedule_state T0<br/>reset task indices, tokens, PCNT baselines<br/>reset local monitor state]
+	G --> H[synch helper monitor<br/>set schedule_started true]
+	H --> I[Enter cyclic executive]
 
-	I --> J[Read now_us]
+	I --> J[Wait until next_frame_start]
+	J --> K[slot = frame_counter mod 10<br/>frame_end = next_frame_start + 10 ms]
+	K --> L[latch_counts_for_slot<br/>A every frame<br/>B every even frame]
+	L --> M[run_slot slot]
+	M --> N[run_sporadic_if_budget<br/>run S only while slack remains]
+	N --> O[sched_monitor_queue_due_report]
+	O --> P{slot == 5?}
+	P -- yes --> Q[sched_monitor_service_line<br/>print one MON line if enough slack remains]
+	P -- no --> R[Skip monitor line this frame]
+	Q --> S[Check frame overrun and throttle warning logs]
+	R --> S
+	S --> T[Idle until frame_end]
+	T --> U[frame_counter++<br/>next_frame_start += 10 ms]
+	U --> I
 
-	J --> KA{now >= next_a_us?}
-	KA -- yes --> A1[Run task A]
-	A1 --> A2[idx_a++ and next_a_us += PERIOD_A]
-	A2 --> A3[Refresh now_us]
-	A3 --> KA
-	KA -- no --> KB{now >= next_b_us?}
+	subgraph SlotMap[Fixed 100 ms Major Cycle]
+		SM0[0: A, B, AGG]
+		SM1[1: A, C]
+		SM2[2: A, B, AGG]
+		SM3[3: A, D]
+		SM4[4: A, B, AGG]
+		SM5[5: A<br/>free frame for S and monitor line]
+		SM6[6: A, B, AGG]
+		SM7[7: A, C]
+		SM8[8: A, B, AGG]
+		SM9[9: A, D]
+	end
 
-	KB -- yes --> B1[Run task B]
-	B1 --> B2[idx_b++ and next_b_us += PERIOD_B]
-	B2 --> B3[Refresh now_us]
-	B3 --> KB
-	KB -- no --> KC{now >= next_agg_us?}
+	M -. dispatch uses .-> SlotMap
 
-	KC -- yes --> C1[Run task AGG]
-	C1 --> C2[idx_agg++ and next_agg_us += PERIOD_AGG]
-	C2 --> C3[Refresh now_us]
-	C3 --> KC
-	KC -- no --> KD{now >= next_c_us?}
+	subgraph TaskPattern[Task Execution Pattern]
+		TP1[Compute release time and seed]
+		TP2[Begin local monitor task timing]
+		TP3[Begin helper monitor task timing]
+		TP4[ACK high]
+		TP5[Run WorkKernel with task budget]
+		TP6[ACK low]
+		TP7[End helper monitor task timing]
+		TP8[End local monitor task timing]
+		TP9[Update token or count state]
+	end
 
-	KD -- yes --> D1[Run task C]
-	D1 --> D2[idx_c++ and next_c_us += PERIOD_C]
-	D2 --> D3[Refresh now_us]
-	D3 --> KD
-	KD -- no --> KE{now >= next_d_us?}
+	M -. each task follows .-> TaskPattern
+	N -. sporadic task follows .-> TaskPattern
 
-	KE -- yes --> E1[Run task D]
-	E1 --> E2[idx_d++ and next_d_us += PERIOD_D]
-	E2 --> E3[Refresh now_us]
-	E3 --> KE
-	KE -- no --> L[Refresh now_us]
+	subgraph Reporting[Local Scheduler-Friendly Monitor Output]
+		RP1[Every 4 s capture local monitor snapshot]
+		RP2[Store pending report state]
+		RP3[During slot 5 print one line only<br/>T0 then A then B then AGG then C then D then S]
+	end
 
-	L --> M{pending S > 0 and\nperiodic slack > guard?}
-	M -- yes --> N{Atomically take one S release?}
-	N -- yes --> O[Run task S and idx_s++]
-	O --> I
-	N -- no --> P[monitorPollReports]
-	M -- no --> P
+	O -. queues .-> Reporting
+	Q -. drains .-> Reporting
 
-	P --> Q{Final report printed now?}
-	Q -- yes --> R[Log final report printed]
-	Q -- no --> I
-	R --> I
+	subgraph ISRSide[ISR Side Events]
+		SY[[ISR SYNC]] --> SY1{sync_seen already?}
+		SY1 -- no --> SY2[Latch sync time and set sync_seen]
+		SY1 -- yes --> SY3[Ignore]
 
-	%% ISR side events
-	IA[[ISR IN_A]] --> IA1[edge_count_a++]
-	IB[[ISR IN_B]] --> IB1[edge_count_b++]
-	IS[[ISR IN_S]] --> IS1{schedule_started?}
-	IS1 -- yes --> IS2[pending_s++ and notifySRelease]
-	IS1 -- no --> IS3[Ignore]
-	IY[[ISR SYNC]] --> IY1{sync_seen already?}
-	IY1 -- no --> IY2[Latch sync time and set sync_seen]
-	IY1 -- yes --> IY3[Ignore]
+		SS[[ISR IN_S]] --> SS1{schedule_started?}
+		SS1 -- yes --> SS2[pending_s++<br/>queue local S release time<br/>notifySRelease helper monitor]
+		SS1 -- no --> SS3[Ignore]
+
+		SA[[IN_A edges]] --> SA1[Counted by PCNT hardware]
+		SB[[IN_B edges]] --> SB1[Counted by PCNT hardware]
+	end
